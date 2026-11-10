@@ -1,20 +1,27 @@
 # Common Thread
 
-A React + TypeScript clothes marketplace. Customer accounts, catalog, orders, stock and payment-proof files are backed by Supabase. Product listings are managed by an administrator. Checkout uses admin-configured manual bank transfer. It is not configured for live use until the deployment setup below is complete.
+A React + TypeScript clothes marketplace with a customer catalog, cart, checkout, account area and administrator-managed inventory.
 
-## Local setup
+## Explore without connecting a backend
 
-1. Create a Supabase project.
-2. Copy `.env.example` to `.env.local` and set `VITE_SUPABASE_URL` and `VITE_SUPABASE_ANON_KEY` from the Supabase project API settings. The browser only uses the publishable/anon key; never put a service-role key in a `VITE_` variable.
-3. Run the SQL migrations in `supabase/migrations` in filename order. They create the schema, access policies, upload buckets and server-side order functions, and retire customer-submitted product listings.
-4. Start the app:
+The app opens on the account creation screen when no backend environment is configured. Enter a name and email to open the local preview.
 
-   ```sh
-   npm install
-   npm run dev
-   ```
+The preview includes 12 sample products across clothing, bags and accessories. You can search and sort the catalog, add items to your bag, try checkout, place a sample order, view its receipt and edit account details. Preview profile and order data are stored only in the current browser. No real account is created, payment is taken or delivery booked.
 
-5. Register your own customer account. To grant the first administrator role, run this once in the Supabase SQL editor, replacing the email:
+Start the preview locally:
+
+```sh
+npm install
+npm run dev
+```
+
+## Connect the live marketplace
+
+1. Create a project and copy `.env.example` to `.env.local`.
+2. Set `VITE_SUPABASE_URL` and `VITE_SUPABASE_ANON_KEY` in `.env.local`. Use only the publishable/anon key in the browser; never expose a service-role key.
+3. Run the SQL migrations in `supabase/migrations` in filename order in the project SQL editor.
+4. Start the app with `npm run dev`. With the environment configured, customer signup, inventory, orders and payment-proof uploads use the live backend instead of preview data.
+5. Register the owner account, then grant it administrator access in the SQL editor. At most one account can have the administrator role; demote any existing administrator before applying the migration if you are changing owners:
 
    ```sql
    update public.profiles
@@ -22,21 +29,19 @@ A React + TypeScript clothes marketplace. Customer accounts, catalog, orders, st
    where id = (select id from auth.users where email = 'owner@example.com');
    ```
 
-   Sign in at `/admin/login`, add the real transfer account and delivery fee, then add products and stock from the admin desk.
+6. Sign in at `/admin/login`; set the transfer account and delivery fee, then add products and stock from the admin desk.
 
-## Marketplace pages
+Configure authentication email confirmation, password recovery, SMTP and allowed redirect URLs before launch. The production database migration also removes customer listing submissions; only administrators manage product listings.
 
-- `/` — published products, search and categories.
-- `/auth` — customer account registration and sign-in.
-- `/products/:productId` — product detail.
-- `/cart` and `/checkout` — cart, delivery location, bank details and proof upload. The server calculates totals and reserves inventory atomically.
-- `/account` and `/orders/:orderId` — customer order history, status and final receipt.
-- `/admin/login` and `/admin` — administrator-only product listings, inventory, transfer settings and payment review.
+## Main routes
 
-The initial delivery fee is a single marketplace-wide charge. If delivery pricing varies by location, extend the settings and checkout to use a server-managed delivery-zone table before launch.
+- `/` — searchable, filterable product catalog.
+- `/auth` — customer account registration and sign-in; local preview entry when no live environment is configured.
+- `/products/:productId` — product details.
+- `/cart` and `/checkout` — cart, delivery location and payment-proof submission for live orders; local sample-order flow in preview mode.
+- `/account` and `/orders/:orderId` — customer details, order history and receipts.
+- `/admin/login` and `/admin` — administrator-only product, stock, transfer and payment management.
 
-## Payment and notifications
+## Payment flow
 
-Admin confirms a transfer from the protected payment-proof bucket. Confirmation marks the order paid and makes the customer receipt available in their account. Rejection releases the reserved item quantities. Customers can see order status and receipts in the site; email notifications were intentionally not added.
-
-Configure Supabase Auth email confirmation, SMTP, password recovery and the production redirect URLs in the Supabase dashboard. Keep database permissions and storage private; do not expose service-role credentials to the browser.
+Live checkout uses admin-configured manual bank transfer. The app reserves stock, collects proof of payment, and makes a receipt available after administrator confirmation. Email notifications are not currently configured.

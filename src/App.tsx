@@ -3,17 +3,31 @@ import { motion } from 'motion/react'
 import { gsap } from 'gsap'
 import { BrowserRouter, Link, Navigate, Route, Routes, useLocation, useNavigate, useParams, useSearchParams } from 'react-router-dom'
 import { errorMessage, formatDate, formatMoney, type Category, type Order, type PaymentSettings, type Product, type UserRole } from './lib/marketplace'
+import { deactivatePreviewProfile, isPreviewActive, previewProducts, readPreviewOrders, readPreviewProfile, savePreviewOrder, savePreviewProfile as persistPreviewProfile, type PreviewOrder, type PreviewProfile } from './lib/preview'
 import { isSupabaseConfigured, requireSupabase } from './lib/supabase'
 import './App.css'
 
 type AuthState = { userId: string | null; email: string; displayName: string; role: UserRole | null; loading: boolean }
+type AuthContextValue = AuthState & { preview: boolean; previewProfile: PreviewProfile | null; savePreviewProfile: (profile: PreviewProfile) => void; signOutPreview: () => void }
 type CartLine = { product: Product; quantity: number }
 type CartState = { items: CartLine[]; add: (product: Product) => void; remove: (productId: string) => void; change: (productId: string, delta: number) => void; clear: () => void }
 
-const AuthContext = createContext<AuthState>({ userId: null, email: '', displayName: '', role: null, loading: isSupabaseConfigured })
+const AuthContext = createContext<AuthContextValue>({ userId: null, email: '', displayName: '', role: null, loading: isSupabaseConfigured, preview: !isSupabaseConfigured, previewProfile: null, savePreviewProfile: () => {}, signOutPreview: () => {} })
 const CartContext = createContext<CartState>({ items: [], add: () => {}, remove: () => {}, change: () => {}, clear: () => {} })
 const categories: Array<Category | 'All pieces'> = ['All pieces', 'Clothing', 'Bags', 'Accessories']
 const imageUrl = (image: string | null) => image || '/images/empty-product.svg'
+
+function initialAuthState(): AuthState {
+  const profile = isSupabaseConfigured ? null : readPreviewProfile()
+  const signedIn = !isSupabaseConfigured && isPreviewActive() && Boolean(profile)
+  return {
+    userId: signedIn ? 'preview-customer' : null,
+    email: signedIn ? profile?.email || '' : '',
+    displayName: signedIn ? profile?.name || '' : '',
+    role: signedIn ? 'customer' : null,
+    loading: isSupabaseConfigured,
+  }
+}
 
 function Icon({ name, size = 20 }: { name: string; size?: number }) {
   const paths: Record<string, ReactNode> = {
@@ -32,7 +46,8 @@ function Icon({ name, size = 20 }: { name: string; size?: number }) {
 }
 
 function AuthProvider({ children }: { children: ReactNode }) {
-  const [auth, setAuth] = useState<AuthState>({ userId: null, email: '', displayName: '', role: null, loading: isSupabaseConfigured })
+  const [auth, setAuth] = useState<AuthState>(initialAuthState)
+  const [previewProfile, setPreviewProfileState] = useState<PreviewProfile | null>(() => isSupabaseConfigured ? null : readPreviewProfile())
   useEffect(() => {
     if (!isSupabaseConfigured) return
     const client = requireSupabase()
@@ -60,7 +75,16 @@ function AuthProvider({ children }: { children: ReactNode }) {
     })
     return () => { active = false; listener.subscription.unsubscribe() }
   }, [])
-  return <AuthContext.Provider value={auth}>{children}</AuthContext.Provider>
+  const saveLocalProfile = (profile: PreviewProfile) => {
+    persistPreviewProfile(profile)
+    setPreviewProfileState(profile)
+    setAuth({ userId: 'preview-customer', email: profile.email, displayName: profile.name, role: 'customer', loading: false })
+  }
+  const signOutLocalProfile = () => {
+    deactivatePreviewProfile()
+    setAuth({ userId: null, email: '', displayName: '', role: null, loading: false })
+  }
+  return <AuthContext.Provider value={{ ...auth, preview: !isSupabaseConfigured, previewProfile, savePreviewProfile: saveLocalProfile, signOutPreview: signOutLocalProfile }}>{children}</AuthContext.Provider>
 }
 
 function CartProvider({ children }: { children: ReactNode }) {
@@ -122,8 +146,9 @@ function Site() {
         <Link className="icon-button bag-button" aria-label={`Shopping bag, ${count} items`} to="/cart"><Icon name="bag" /><span className="bag-count">{count}</span></Link>
       </div>
     </header>
+    {!isSupabaseConfigured && <div className="preview-notice">Preview mode · Sample catalog and orders are saved only in this browser.</div>}
     <Routes>
-      <Route path="/" element={<Home query={query} onQueryChange={updateQuery} />} />
+      <Route path="/" element={!isSupabaseConfigured && !userId ? <Navigate to="/auth" replace /> : <Home query={query} onQueryChange={updateQuery} />} />
       <Route path="/products/:productId" element={<ProductPage />} />
       <Route path="/auth" element={<AuthPage />} />
       <Route path="/cart" element={<CartPage />} />
@@ -140,7 +165,7 @@ function Site() {
 
 function Home({ query, onQueryChange }: { query: string; onQueryChange: (value: string) => void }) {
   const heroRef = useRef<HTMLElement>(null)
-  const [products, setProducts] = useState<Product[]>([])
+  const [products, setProducts] = useState<Product[]>(() => isSupabaseConfigured ? [] : previewProducts)
   const [searchParams, setSearchParams] = useSearchParams()
   const category = categories.find((item) => item.toLowerCase() === (searchParams.get('category') || '').toLowerCase()) || 'All pieces'
   const [sort, setSort] = useState<'newest' | 'price-low' | 'price-high'>('newest')
@@ -216,6 +241,23 @@ function AuthPage() {
     event.preventDefault()
     setBusy(true); setError(''); setMessage('')
     const data = new FormData(event.currentTarget)
+    if (auth.preview) {
+      const profile = {
+        name: String(data.get('name') || '').trim(),
+        email: String(data.get('email') || '').trim().toLowerCase(),
+        phone: '',
+        address: '',
+      }
+      if (profile.name.length < 2 || !profile.email) {
+        setBusy(false)
+        setError('Enter your name and email to open the preview.')
+        return
+      }
+      auth.savePreviewProfile(profile)
+      setBusy(false)
+      navigate(new URLSearchParams(location.search).get('next') || '/', { replace: true })
+      return
+    }
     const client = requireSupabase()
     const email = String(data.get('email')).trim()
     const password = String(data.get('password'))
@@ -225,21 +267,22 @@ function AuthPage() {
     setBusy(false)
     if (result.error) { setError(result.error.message); return }
     if (mode === 'signup' && !result.data.session) { setMessage('Check your email to confirm your account, then sign in to continue.'); return }
-    const redirect = new URLSearchParams(location.search).get('next') || (location.pathname.startsWith('/admin') ? '/admin' : '/account')
+    const redirect = new URLSearchParams(location.search).get('next') || (auth.preview ? '/' : location.pathname.startsWith('/admin') ? '/admin' : '/account')
     navigate(redirect)
   }
   if (auth.loading) return <PageLoading />
   if (auth.userId) return <Navigate to="/account" replace />
-  return <PageFrame><div className="page-intro"><span className="eyebrow">{mode === 'signup' ? 'Pull up a chair' : 'Good to see you again'}</span><h1>{mode === 'signup' ? <>Good to have<br /><em>you here.</em></> : <>Welcome<br /><em>back.</em></>}</h1><p>{mode === 'signup' ? 'Create your account to check out, follow orders and keep your good finds together.' : 'Sign in to find your orders and receipts.'}</p></div><section className="form-page-card">
+  return <PageFrame><div className="page-intro"><span className="eyebrow">{auth.preview ? 'Welcome to Common Thread' : mode === 'signup' ? 'Pull up a chair' : 'Good to see you again'}</span><h1>{auth.preview ? <>Take a look<br /><em>around.</em></> : mode === 'signup' ? <>Good to have<br /><em>you here.</em></> : <>Welcome<br /><em>back.</em></>}</h1><p>{auth.preview ? 'Create a local preview profile to explore the catalog, place a sample order and try your account settings. No real account or payment is created.' : mode === 'signup' ? 'Create your account to check out, follow orders and keep your good finds together.' : 'Sign in to find your orders and receipts.'}</p></div><section className="form-page-card">
     {error && <ErrorBanner message={error} />}{message && <div className="success-banner">{message}</div>}
-    <form className="stack-form" onSubmit={(event) => void submit(event)}>{mode === 'signup' && <label>Your name<input name="name" autoComplete="name" required minLength={2} placeholder="What should we call you?" /></label>}<label>Email address<input name="email" type="email" autoComplete="email" required placeholder="you@example.com" /></label><label>Password<input name="password" type="password" autoComplete={mode === 'signup' ? 'new-password' : 'current-password'} required minLength={8} placeholder="At least 8 characters" /></label><button className="button button-dark form-submit" type="submit" disabled={busy || !isSupabaseConfigured}>{busy ? 'Just a moment…' : mode === 'signup' ? 'Create your account' : 'Sign in'} <Icon name="arrow" size={18} /></button></form>
-    <p className="form-switch">{mode === 'signup' ? 'Already have an account?' : 'New to Common Thread?'} <button onClick={() => { setMode(mode === 'signup' ? 'login' : 'signup'); setError(''); setMessage('') }}>{mode === 'signup' ? 'Sign in' : 'Create an account'}</button></p>
+    <form className="stack-form" onSubmit={(event) => void submit(event)}>{(auth.preview || mode === 'signup') && <label>Your name<input name="name" autoComplete="name" required minLength={2} defaultValue={auth.previewProfile?.name || ''} placeholder="What should we call you?" /></label>}<label>Email address<input name="email" type="email" autoComplete="email" required defaultValue={auth.previewProfile?.email || ''} placeholder="you@example.com" /></label>{!auth.preview && <label>Password<input name="password" type="password" autoComplete={mode === 'signup' ? 'new-password' : 'current-password'} required minLength={8} placeholder="At least 8 characters" /></label>}<button className="button button-dark form-submit" type="submit" disabled={busy || (!auth.preview && !isSupabaseConfigured)}>{busy ? 'Just a moment…' : auth.preview ? 'Enter the preview shop' : mode === 'signup' ? 'Create your account' : 'Sign in'} <Icon name="arrow" size={18} /></button></form>
+    {!auth.preview && <p className="form-switch">{mode === 'signup' ? 'Already have an account?' : 'New to Common Thread?'} <button onClick={() => { setMode(mode === 'signup' ? 'login' : 'signup'); setError(''); setMessage('') }}>{mode === 'signup' ? 'Sign in' : 'Create an account'}</button></p>}
   </section></PageFrame>
 }
 
 function ProductPage() {
   const { productId = '' } = useParams()
   const [product, setProduct] = useState<Product | null>(null)
+  const displayedProduct = isSupabaseConfigured ? product : previewProducts.find((item) => item.id === productId) || null
   const [error, setError] = useState('')
   const [loading, setLoading] = useState(isSupabaseConfigured)
   const { add } = useCart()
@@ -256,8 +299,8 @@ function ProductPage() {
   }, [productId])
   if (error) return <PageFrame><ErrorBanner message={error} /></PageFrame>
   if (loading) return <PageLoading />
-  if (!product) return <PageFrame><EmptyState title="That piece has found a home." text="It may have sold already. There are more good finds in the shop." action="Browse the shop" to="/" /></PageFrame>
-  return <PageFrame><div className="product-page"><div className="product-page-image"><img src={imageUrl(product.image_url)} alt={product.name} /></div><div className="product-page-info"><span className="eyebrow">{product.category} · {product.color}</span><h1>{product.name}</h1><strong className="product-page-price">{formatMoney(product.price)}</strong><p>{product.description || 'Thoughtfully selected and ready for a new home.'}</p><p className="product-stock">{product.stock ? `${product.stock} available` : 'Currently sold out'}</p><button className="button button-dark" disabled={!product.stock} onClick={() => add(product)}>Add to your bag <Icon name="arrow" size={18} /></button><p className="product-page-note">A little different. A lot more you.</p></div></div></PageFrame>
+  if (!displayedProduct) return <PageFrame><EmptyState title="That piece has found a home." text="It may have sold already. There are more good finds in the shop." action="Browse the shop" to="/" /></PageFrame>
+  return <PageFrame><div className="product-page"><div className="product-page-image"><img src={imageUrl(displayedProduct.image_url)} alt={displayedProduct.name} /></div><div className="product-page-info"><span className="eyebrow">{displayedProduct.category} · {displayedProduct.color}</span><h1>{displayedProduct.name}</h1><strong className="product-page-price">{formatMoney(displayedProduct.price)}</strong><p>{displayedProduct.description || 'Thoughtfully selected and ready for a new home.'}</p><p className="product-stock">{displayedProduct.stock ? `${displayedProduct.stock} available` : 'Currently sold out'}</p><button className="button button-dark" disabled={!displayedProduct.stock} onClick={() => add(displayedProduct)}>Add to your bag <Icon name="arrow" size={18} /></button><p className="product-page-note">A little different. A lot more you.</p></div></div></PageFrame>
 }
 
 function CartPage() {
@@ -276,8 +319,8 @@ function CheckoutPage() {
   const resumeOrderId = searchParams.get('order')
   const [settings, setSettings] = useState<PaymentSettings | null>(null)
   const [reservedOrder, setReservedOrder] = useState<Order | null>(null)
-  const [address, setAddress] = useState('')
-  const [phone, setPhone] = useState('')
+  const [address, setAddress] = useState(auth.previewProfile?.address || '')
+  const [phone, setPhone] = useState(auth.previewProfile?.phone || '')
   const [proof, setProof] = useState<File | null>(null)
   const [busy, setBusy] = useState(false)
   const [loading, setLoading] = useState(isSupabaseConfigured)
@@ -316,6 +359,35 @@ function CheckoutPage() {
     if (!auth.userId) { navigate(`/auth?next=${encodeURIComponent('/checkout')}`); return }
     if (!cart.items.length) return
     setBusy(true); setError('')
+    if (auth.preview) {
+      if (!auth.previewProfile) {
+        setBusy(false)
+        navigate(`/auth?next=${encodeURIComponent('/checkout')}`)
+        return
+      }
+      const id = crypto.randomUUID()
+      const deliveryFee = 2500
+      const order: PreviewOrder = {
+        id,
+        order_number: `PREVIEW-${Date.now().toString().slice(-6)}`,
+        customer_name: auth.previewProfile.name,
+        customer_email: auth.previewProfile.email,
+        phone: phone.trim(),
+        delivery_address: address.trim(),
+        items: cart.items.map(({ product, quantity }) => ({ product_id: product.id, product_name: product.name, unit_price: product.price, quantity })),
+        items_subtotal: subtotal,
+        delivery_fee: deliveryFee,
+        total: subtotal + deliveryFee,
+        created_at: new Date().toISOString(),
+        status: 'preview',
+      }
+      savePreviewOrder(order)
+      auth.savePreviewProfile({ ...auth.previewProfile, phone: phone.trim(), address: address.trim() })
+      cart.clear()
+      setBusy(false)
+      navigate(`/orders/${id}`)
+      return
+    }
     try {
       const client = requireSupabase()
       const { data, error: orderError } = await client.rpc('start_marketplace_order', {
@@ -356,24 +428,32 @@ function CheckoutPage() {
   if (loading) return <PageLoading />
   if (!cart.items.length && !reservedOrder) return <PageFrame><EmptyState title="Your bag is empty." text="Add a few good finds before checking out." action="Browse the shop" to="/" /></PageFrame>
   const orderItems = reservedOrder?.order_items
-  const total = reservedOrder?.total ?? subtotal + (settings?.delivery_fee || 0)
-  return <PageFrame><div className="page-heading"><span className="eyebrow">{reservedOrder ? 'Your order is reserved for 30 minutes' : 'One last little thing'}</span><h1>Checkout <em>securely.</em></h1><p>{reservedOrder ? 'Transfer the exact amount below, then upload your proof so our team can confirm your order.' : 'Add your delivery location and phone number. We’ll confirm live stock and reserve the total before showing payment details.'}</p></div>
+  const deliveryFee = auth.preview ? 2500 : settings?.delivery_fee || 0
+  const total = reservedOrder?.total ?? subtotal + deliveryFee
+  return <PageFrame><div className="page-heading"><span className="eyebrow">{auth.preview ? 'Sample checkout' : reservedOrder ? 'Your order is reserved for 30 minutes' : 'One last little thing'}</span><h1>Checkout <em>{auth.preview ? 'preview.' : 'securely.'}</em></h1><p>{auth.preview ? 'Enter delivery details to try the order flow. This creates a sample order in this browser only; no payment is taken.' : reservedOrder ? 'Transfer the exact amount below, then upload your proof so our team can confirm your order.' : 'Add your delivery location and phone number. We’ll confirm live stock and reserve the total before showing payment details.'}</p></div>
     <div className="checkout-layout"><div className="form-page-card checkout-form">{error && <ErrorBanner message={error} />}
-      {!reservedOrder ? <form className="stack-form" onSubmit={(event) => void reserveOrder(event)}><h2>Delivery details</h2><label>Delivery address<textarea value={address} onChange={(event) => setAddress(event.target.value)} rows={3} required placeholder="Street, area, city and any helpful directions" /></label><label>Phone number<input type="tel" value={phone} onChange={(event) => setPhone(event.target.value)} required placeholder="+234 800 000 0000" /></label><p className="muted-copy">Your order and amount are verified against live stock and locked for 30 minutes before you transfer.</p><button className="button button-dark form-submit" type="submit" disabled={busy || !settings?.account_number}>{busy ? 'Checking stock…' : 'Confirm order & show payment details'} <Icon name="arrow" size={18} /></button></form>
+      {!reservedOrder ? <form className="stack-form" onSubmit={(event) => void reserveOrder(event)}><h2>Delivery details</h2><label>Delivery address<textarea value={address} onChange={(event) => setAddress(event.target.value)} rows={3} required placeholder="Street, area, city and any helpful directions" /></label><label>Phone number<input type="tel" value={phone} onChange={(event) => setPhone(event.target.value)} required placeholder="+234 800 000 0000" /></label><p className="muted-copy">{auth.preview ? 'Sample delivery fee is ₦2,500. No booking or payment is sent to a store.' : 'Your order and amount are verified against live stock and locked for 30 minutes before you transfer.'}</p><button className="button button-dark form-submit" type="submit" disabled={busy || (!auth.preview && !settings?.account_number)}>{busy ? 'Placing sample order…' : auth.preview ? 'Place sample order' : 'Confirm order & show payment details'} <Icon name="arrow" size={18} /></button></form>
         : <><h2>Transfer to this account</h2>{reservedOrder.account_number ? <div className="bank-card"><span>TRANSFER DETAILS · COMMON THREAD</span><strong>{reservedOrder.account_name}</strong><div><span>Bank</span><b>{reservedOrder.bank_name}</b></div><div><span>Account number</span><b>{reservedOrder.account_number}</b></div><div><span>Order number</span><b>{reservedOrder.order_number}</b></div><div><span>Order total (delivery included)</span><b>{formatMoney(reservedOrder.total)}</b></div></div> : <ErrorBanner message="The marketplace has not added bank transfer details yet." />}
           <form className="stack-form" onSubmit={(event) => void submitProof(event)}><label className="upload-field">Upload proof of payment<input type="file" accept="image/jpeg,image/png,image/webp,application/pdf" required onChange={(event) => setProof(event.target.files?.[0] || null)} /><span className="upload-prompt"><Icon name="upload" size={18} /> {proof?.name || 'Choose a screenshot or PDF receipt'}</span></label><p className="muted-copy">Our team will check the transfer and confirm your receipt here in your account.</p><button className="button button-dark form-submit" type="submit" disabled={busy || !proof || !reservedOrder.account_number}>{busy ? 'Uploading proof…' : 'Submit payment proof'} <Icon name="arrow" size={18} /></button></form></>}
-    </div><aside className="checkout-summary"><span className="eyebrow">{reservedOrder ? `Order ${reservedOrder.order_number}` : 'Your order'}</span>{reservedOrder ? orderItems?.map((item) => <div className="checkout-line" key={item.id}><span>{item.product_name} × {item.quantity}</span><strong>{formatMoney(item.unit_price * item.quantity)}</strong></div>) : cart.items.map(({ product, quantity }) => <div className="checkout-line" key={product.id}><span>{product.name} × {quantity}</span><strong>{formatMoney(product.price * quantity)}</strong></div>)}<div className="checkout-line"><span>Delivery</span><strong>{reservedOrder ? formatMoney(reservedOrder.delivery_fee) : settings ? formatMoney(settings.delivery_fee) : 'Shown at checkout'}</strong></div><div className="checkout-total"><span>Total</span><strong>{formatMoney(total)}</strong></div></aside></div>
+    </div><aside className="checkout-summary"><span className="eyebrow">{reservedOrder ? `Order ${reservedOrder.order_number}` : 'Your order'}</span>{reservedOrder ? orderItems?.map((item) => <div className="checkout-line" key={item.id}><span>{item.product_name} × {item.quantity}</span><strong>{formatMoney(item.unit_price * item.quantity)}</strong></div>) : cart.items.map(({ product, quantity }) => <div className="checkout-line" key={product.id}><span>{product.name} × {quantity}</span><strong>{formatMoney(product.price * quantity)}</strong></div>)}<div className="checkout-line"><span>Delivery</span><strong>{reservedOrder ? formatMoney(reservedOrder.delivery_fee) : settings ? formatMoney(settings.delivery_fee) : formatMoney(deliveryFee)}</strong></div><div className="checkout-total"><span>Total</span><strong>{formatMoney(total)}</strong></div></aside></div>
   </PageFrame>
 }
 
 function AccountPage() {
   const auth = useAuth()
   const [orders, setOrders] = useState<Order[]>([])
-  const [loading, setLoading] = useState(true)
+  const previewOrders = auth.preview ? readPreviewOrders() : []
+  const [name, setName] = useState(auth.previewProfile?.name || auth.displayName)
+  const [phone, setPhone] = useState(auth.previewProfile?.phone || '')
+  const [address, setAddress] = useState(auth.previewProfile?.address || '')
+  const [loading, setLoading] = useState(isSupabaseConfigured)
   const [error, setError] = useState('')
+  const [notice, setNotice] = useState('')
+  const [busy, setBusy] = useState(false)
   const navigate = useNavigate()
   useEffect(() => {
     if (!auth.userId) return
+    if (auth.preview) return
     const client = requireSupabase()
     const refreshOrders = async () => {
       const cleanup = await client.rpc('release_expired_marketplace_holds')
@@ -388,21 +468,45 @@ function AccountPage() {
       event: '*', schema: 'public', table: 'orders', filter: `customer_id=eq.${auth.userId}`,
     }, () => { void refreshOrders() }).subscribe()
     return () => { void client.removeChannel(channel) }
-  }, [auth.userId])
-  const signOut = async () => { const { error: signOutError } = await requireSupabase().auth.signOut(); if (signOutError) setError(signOutError.message); else navigate('/') }
+  }, [auth.userId, auth.preview])
+  const saveAccount = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault()
+    setBusy(true); setError(''); setNotice('')
+    if (auth.preview) {
+      auth.savePreviewProfile({ name: name.trim(), email: auth.email, phone: phone.trim(), address: address.trim() })
+      setNotice('Preview account details saved in this browser.')
+      setBusy(false)
+      return
+    }
+    const { error: updateError } = await requireSupabase().from('profiles').update({ display_name: name.trim() }).eq('id', auth.userId)
+    if (updateError) setError(updateError.message)
+    else setNotice('Account details saved.')
+    setBusy(false)
+  }
+  const signOut = async () => {
+    if (auth.preview) { auth.signOutPreview(); navigate('/auth'); return }
+    const { error: signOutError } = await requireSupabase().auth.signOut()
+    if (signOutError) setError(signOutError.message)
+    else navigate('/')
+  }
   if (auth.loading) return <PageLoading />
   if (!auth.userId) return <Navigate to="/auth?next=%2Faccount" replace />
-  return <PageFrame><div className="page-heading"><span className="eyebrow">Your Common Thread</span><h1>Hey, {auth.displayName || 'there'}.</h1><p>{auth.email}</p><button className="text-link" onClick={() => void signOut()}>Sign out</button></div>{error && <ErrorBanner message={error} />}<section className="account-orders"><h2>Your orders</h2>{loading ? <PageLoading /> : orders.length ? orders.map((order) => <Link className="account-order" to={`/orders/${order.id}`} key={order.id}><div><b>{order.order_number}</b><small>{formatDate(order.created_at)} · {order.order_items?.length || 0} piece(s)</small></div><span className={`order-status ${order.status === 'confirmed' ? 'confirmed' : ''}`}>{order.status.replace('_', ' ')}</span><strong>{formatMoney(order.total)} →</strong></Link>) : <EmptyState title="Nothing in your order book yet." text="Let’s find your first good thing." action="Browse the shop" to="/" />}</section></PageFrame>
+  const hasOrders = auth.preview ? previewOrders.length > 0 : orders.length > 0
+  return <PageFrame><div className="page-heading"><span className="eyebrow">{auth.preview ? 'Preview account' : 'Your Common Thread'}</span><h1>Hey, {auth.displayName || 'there'}.</h1><p>{auth.email}</p><button className="text-link" onClick={() => void signOut()}>Sign out</button></div>{error && <ErrorBanner message={error} />}{notice && <div className="success-banner">{notice}</div>}
+    <div className="account-layout"><form className="form-page-card stack-form account-settings" onSubmit={(event) => void saveAccount(event)}><h2>Account details</h2><label>Your name<input value={name} onChange={(event) => setName(event.target.value)} required minLength={2} /></label><label>Email address<input value={auth.email} readOnly /></label><label>Phone number<input type="tel" value={phone} onChange={(event) => setPhone(event.target.value)} placeholder="+234 800 000 0000" /></label><label>Delivery address<textarea rows={3} value={address} onChange={(event) => setAddress(event.target.value)} placeholder="Add your preferred delivery address" /></label>{auth.preview && <p className="muted-copy">Preview details are saved only in this browser.</p>}<button className="button button-dark" type="submit" disabled={busy}>{busy ? 'Saving…' : 'Save account details'} <Icon name="check" size={17} /></button></form>
+      <section className="account-orders"><h2>Your orders</h2>{loading ? <PageLoading /> : hasOrders ? auth.preview ? previewOrders.map((order) => <Link className="account-order" to={`/orders/${order.id}`} key={order.id}><div><b>{order.order_number}</b><small>{formatDate(order.created_at)} · {order.items.length} piece(s)</small></div><span className="order-status">{auth.preview ? 'sample' : order.status.replace('_', ' ')}</span><strong>{formatMoney(order.total)} →</strong></Link>) : orders.map((order) => <Link className="account-order" to={`/orders/${order.id}`} key={order.id}><div><b>{order.order_number}</b><small>{formatDate(order.created_at)} · {order.order_items?.length || 0} piece(s)</small></div><span className={`order-status ${order.status === 'confirmed' ? 'confirmed' : ''}`}>{order.status.replace('_', ' ')}</span><strong>{formatMoney(order.total)} →</strong></Link>) : <EmptyState title="Nothing in your order book yet." text="Let’s find your first good thing." action="Browse the shop" to="/" />}</section></div></PageFrame>
 }
 
 function OrderPage() {
   const { orderId = '' } = useParams()
   const auth = useAuth()
   const [order, setOrder] = useState<Order | null>(null)
+  const previewOrder = auth.preview ? readPreviewOrders().find((item) => item.id === orderId) || null : null
   const [error, setError] = useState('')
-  const [loading, setLoading] = useState(true)
+  const [loading, setLoading] = useState(isSupabaseConfigured)
   useEffect(() => {
     if (!auth.userId) return
+    if (auth.preview) return
     const client = requireSupabase()
     const refreshOrder = async () => {
       const cleanup = await client.rpc('release_expired_marketplace_holds')
@@ -417,9 +521,14 @@ function OrderPage() {
       event: 'UPDATE', schema: 'public', table: 'orders', filter: `id=eq.${orderId}`,
     }, () => { void refreshOrder() }).subscribe()
     return () => { void client.removeChannel(channel) }
-  }, [auth.userId, orderId])
+  }, [auth.userId, auth.preview, orderId])
   if (auth.loading) return <PageLoading />
   if (!auth.userId) return <Navigate to={`/auth?next=${encodeURIComponent(`/orders/${orderId}`)}`} replace />
+  if (auth.preview) {
+    if (loading) return <PageLoading />
+    if (!previewOrder) return <PageFrame><EmptyState title="We can’t find that sample order." text="Your preview bookings are listed in your account." action="My account" to="/account" /></PageFrame>
+    return <PageFrame><div className="receipt-page"><div className="preview-label">SAMPLE ORDER · NOT A REAL PURCHASE</div><div className="receipt-mark"><Icon name="check" size={23} /></div><span className="eyebrow">Preview order placed</span><h1>Your order <em>preview.</em></h1><p>This sample booking is saved in this browser only. No payment was made and nothing will be delivered.</p><div className="receipt-card"><div className="receipt-top"><span>COMMON THREAD · SAMPLE</span><strong>{previewOrder.order_number}</strong></div><div className="receipt-row"><span>Placed by</span><b>{previewOrder.customer_name}</b></div><div className="receipt-row"><span>Date</span><b>{formatDate(previewOrder.created_at)}</b></div><div className="receipt-items">{previewOrder.items.map((item) => <div key={item.product_id}><span>{item.product_name} × {item.quantity}</span><b>{formatMoney(item.unit_price * item.quantity)}</b></div>)}</div><div className="receipt-row"><span>Delivery (sample)</span><b>{formatMoney(previewOrder.delivery_fee)}</b></div><div className="receipt-total"><span>Sample total</span><strong>{formatMoney(previewOrder.total)}</strong></div><div className="receipt-address"><Icon name="pin" size={16} />{previewOrder.delivery_address}</div></div><Link className="button button-dark" to="/account">View my account <Icon name="arrow" size={18} /></Link></div></PageFrame>
+  }
   if (error) return <PageFrame><ErrorBanner message={error} /></PageFrame>
   if (loading) return <PageLoading />
   if (!order) return <PageFrame><EmptyState title="We can’t find that order." text="Check your account for your current orders." action="My account" to="/account" /></PageFrame>
