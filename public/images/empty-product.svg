@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="720" height="900" viewBox="0 0 720 900" fill="none">
+  <rect width="720" height="900" fill="#E9E6DC"/>
+  <path d="M360 385c-53 0-96 43-96 96v110h192V481c0-53-43-96-96-96Z" stroke="#A8A397" stroke-width="2"/>
+  <path d="m306 421-57 34-48 109 53 24 31-63v163h150V525l31 63 53-24-48-109-57-34c-14 17-34 27-54 27s-40-10-54-27Z" fill="#D9D5CA" stroke="#A8A397" stroke-width="2"/>
+  <circle cx="360" cy="320" r="52" stroke="#A8A397" stroke-width="2"/>
+  <path d="M347 320h26m-13-13v26" stroke="#C84E35" stroke-width="2"/>
+  <text x="360" y="790" fill="#77756F" font-family="Arial,sans-serif" font-size="15" letter-spacing="3" text-anchor="middle">A GOOD FIND IS ON ITS WAY</text>
+</svg>
